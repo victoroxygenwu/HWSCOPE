@@ -12,10 +12,14 @@
 ; 断言约定（主机侧）：hws.log 应恰含两行 "MEASURING..."（首轮+重测轮），
 ;   且 BAT 续写 SMOKE-DONE 标记；DISK.BIN 应已被子程序自删。
 ; ⚠️ PROG 为绝对 DOS 路径，依赖 gen_conf 的扁平运行根（D: = 运行根）。
+STACK_BYTES EQU 512
+
 CODE    SEGMENT
         ASSUME CS:CODE, DS:CODE
 
 PSP_SEG DW 0                 ; 入口 PSP 段（4Ah 缩小内存用）
+EXEC_SS DW 0                 ; EXEC 前保存父进程栈，返回后先恢复再压栈
+EXEC_SP DW 0
 OLD16   DD 0                 ; 原 INT 16H 向量（偏移:段）
 KQ      DW 8 DUP(0)          ; 注入键队列（队首 KQ[0]）
 KQN     DB 0                 ; 队列待取键数
@@ -38,10 +42,13 @@ START:
         PUSH CS
         POP DS                ; DS = CS（全部数据同段访问）
         POP PSP_SEG           ; PSP 段 -> CS:PSP_SEG
+        ; STACK 是最后一个段；保留 PSP 到栈顶的全部段落，不能截掉栈
+        MOV BX, SS
+        SUB BX, PSP_SEG
+        ADD BX, (STACK_BYTES+15)/16
         ; ---- 缩小内存块为 EXEC 腾空间（失败可忽略）----
         MOV AH, 4AH
         MOV ES, PSP_SEG
-        MOV BX, 512           ; 保留 8KB（实际用量 <1KB）
         INT 21H
         ; ---- 保存并钩住 INT 16H ----
         MOV AX, 3516H
@@ -76,9 +83,16 @@ START:
         ; ---- EXEC 子程序（DS:DX = CS:PROG）----
         MOV DX, OFFSET PROG
         MOV BX, OFFSET PARMBLK
+        MOV EXEC_SS, SS
+        MOV EXEC_SP, SP
         MOV AX, 4B00H
         INT 21H               ; CF=1 失败（AX=错误码）
-        JC  EXEC_FAIL
+        MOV SS, CS:EXEC_SS     ; MOV SS 后紧接 MOV SP，恢复期间不接受中断
+        MOV SP, CS:EXEC_SP
+        PUSH CS
+        POP DS                ; EXEC 后不依赖返回的 DS
+        PUSHF                 ; 保存 EXEC 的 CF 和 AX，成功/失败均先卸钩
+        PUSH AX
         ; ---- 恢复 INT 16H 向量（DS:DX = 原向量）----
         MOV DX, WORD PTR OLD16
         MOV AX, WORD PTR OLD16+2
@@ -87,6 +101,9 @@ START:
         INT 21H
         PUSH CS
         POP DS
+        POP AX
+        POPF
+        JC  EXEC_FAIL
         ; ---- 透传子进程退出码 ----
         MOV AH, 4DH
         INT 21H
@@ -187,4 +204,9 @@ PH2:    MOV DL, AL
         RET
 PHEX    ENDP
 CODE    ENDS
+
+; 必须放在 CODE 后：SS + 栈长即整个父进程需要保留的最高地址
+STACK   SEGMENT PARA STACK 'STACK'
+        DB STACK_BYTES DUP (?)
+STACK   ENDS
         END START

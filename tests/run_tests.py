@@ -16,8 +16,8 @@ import time
 TESTS = pathlib.Path(__file__).resolve().parent
 ROOT = TESTS.parent
 PY = sys.executable
-DOSBOX = pathlib.Path(r"D:\dosbox\DOSBox.exe")
-TIMEOUT = 240  # 秒（含提交版冒烟：KEYHOOK EXEC 两轮测量约 +40s）
+# 完整流程包含 HWV 一轮、HWD 五轮吞吐和提交版两轮测量。
+TIMEOUT = float(os.environ.get("HWSCOPE_TIMEOUT", "360"))
 HEADLESS = "--window" not in sys.argv
 
 sys.path.insert(0, str(TESTS))
@@ -30,13 +30,40 @@ def sh(cmd):
     return subprocess.run(cmd, capture_output=True, text=True, errors="replace")
 
 
+def find_dosbox() -> pathlib.Path:
+    configured = os.environ.get("HWSCOPE_DOSBOX")
+    if configured:
+        found = shutil.which(configured)
+        if found:
+            return pathlib.Path(found)
+        raise FileNotFoundError(f"HWSCOPE_DOSBOX 不可执行：{configured}")
+    for name in ("dosbox-x", "dosbox", "DOSBox.exe"):
+        found = shutil.which(name)
+        if found:
+            return pathlib.Path(found)
+    legacy = pathlib.Path(r"D:\dosbox\DOSBox.exe")
+    if legacy.is_file():
+        return legacy
+    raise FileNotFoundError("未找到 DOSBox，请设置 HWSCOPE_DOSBOX 或加入 PATH")
+
+
 def dosbox_running() -> bool:
-    r = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq DOSBox.exe"],
-        capture_output=True,
-    )
-    out = (r.stdout or b"").decode("utf-8", errors="replace")
-    return "DOSBox.exe" in out
+    if sys.platform == "win32":
+        r = sh(["tasklist", "/FO", "CSV", "/NH"])
+        names = [line.split(',')[0].strip('"').lower() for line in r.stdout.splitlines()]
+    else:
+        r = sh(["ps", "-A", "-o", "comm="])
+        names = [pathlib.Path(line.strip()).name.lower() for line in r.stdout.splitlines()]
+    if r.returncode:
+        raise RuntimeError("无法检查模拟器进程：" + r.stderr.strip())
+    return any(n in ("dosbox", "dosbox-x", "dosbox.exe", "dosbox-x.exe") for n in names)
+
+
+def dosbox_command(executable, conf):
+    cmd = [str(executable)]
+    if "dosbox-x" in executable.name.lower():
+        cmd += ["-defaultconf", "-nopromptfolder"]
+    return cmd + ["-conf", str(conf)]
 
 
 def shoot(path: pathlib.Path) -> bool:
@@ -47,10 +74,11 @@ def shoot(path: pathlib.Path) -> bool:
         print(f"[shoot] import failed: {e}")
         return False
     try:
-        h = ctypes.windll.user32.FindWindowW("SDL_app", None)
-        if h:
-            ctypes.windll.user32.SetForegroundWindow(h)
-            time.sleep(0.3)
+        if sys.platform == "win32":
+            h = ctypes.windll.user32.FindWindowW("SDL_app", None)
+            if h:
+                ctypes.windll.user32.SetForegroundWindow(h)
+                time.sleep(0.3)
         img = ImageGrab.grab()
         img.save(str(path))
         return True
@@ -93,6 +121,14 @@ def main() -> int:
         checks.append((name, None, str(detail)))
         print(f"[SKIP] {name} {detail}")
 
+    # 在生成运行目录前检查依赖与已有实例，不干扰其它测量。
+    executable = find_dosbox()
+    if not TIMEOUT > 0:
+        raise ValueError("HWSCOPE_TIMEOUT 必须大于零")
+    if dosbox_running():
+        log_ok("dosbox_start", False, "已有 DOSBox 实例在运行，请先关闭再测")
+        return report(outdir, checks)
+
     # 1. 生成变体与 DOSBox 环境
     r = sh([PY, str(TESTS / "mkvariants.py")])
     log_ok("mkvariants", r.returncode == 0, (r.stdout + r.stderr).strip())
@@ -134,16 +170,15 @@ def main() -> int:
         complete.unlink()
 
     # 3. 启动 DOSBox
-    if dosbox_running():
-        log_ok("dosbox_start", False, "已有 DOSBox.exe 在运行，请先关闭再测")
-        return report(outdir, checks)
     conf = run_dir / "test.conf"
     dosbox_env = dict(os.environ)
     if HEADLESS:
         # 无头：SDL dummy 驱动，全程不弹窗口（屏幕断言走 DUMP.BIN，不受影响）
         dosbox_env["SDL_VIDEODRIVER"] = "dummy"
         dosbox_env["SDL_AUDIODRIVER"] = "dummy"
-    proc = subprocess.Popen([str(DOSBOX), "-conf", str(conf)], env=dosbox_env)
+    host_log = (outdir / "dosbox.log").open("w", encoding="utf-8")
+    proc = subprocess.Popen(dosbox_command(executable, conf), env=dosbox_env,
+                            cwd=run_dir, stdout=host_log, stderr=subprocess.STDOUT)
     log_ok("dosbox_start", True, f"pid={proc.pid} headless={HEADLESS}")
 
     # 4. 等待渲染标记 -> 截图；等待总完成标记（runall_complete.log）
@@ -154,7 +189,14 @@ def main() -> int:
     t0 = time.time()
     shot_done = False
     run_ok = False
+    stages = []
+    stage_path = run_dir / "logs" / "STAGE.TXT"
     while time.time() - t0 < TIMEOUT:
+        if stage_path.exists():
+            stage = stage_path.read_text(errors="replace").strip()
+            if stage and (not stages or stage != stages[-1][0]):
+                stages.append((stage, round(time.time() - t0, 2)))
+                print(f"[stage] {stage} elapsed={stages[-1][1]}s", flush=True)
         if rendered.exists() and not shot_done and not HEADLESS:
             time.sleep(1.0)  # 等窗口绘制
             ok = shoot(outdir / "m0_pattern.png")
@@ -185,6 +227,14 @@ def main() -> int:
         proc.wait(timeout=20)
     except subprocess.TimeoutExpired:
         proc.kill()
+        proc.wait()
+    host_log.close()
+    (outdir / "run.json").write_text(json.dumps({
+        "command": dosbox_command(executable, conf),
+        "run_root": str(run_dir), "timeout": TIMEOUT,
+        "elapsed_seconds": round(time.time() - t0, 2),
+        "exit_code": proc.returncode, "stages": stages,
+    }, indent=2), encoding="utf-8")
 
     # 5. 构建断言（EXE 存在 + 日志无 error）
     for variant, tag, exe in (("s", "HWSCOPE", "HWSCOPE.EXE"),
