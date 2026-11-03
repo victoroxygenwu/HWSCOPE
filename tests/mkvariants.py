@@ -19,6 +19,7 @@ def make(variant: int, name: str) -> None:
     )
     if n != 1:
         sys.exit(f"ERROR: VARIANT 行匹配失败 (n={n})，请检查 HWSCOPE.ASM 头部")
+    OUTDIR.mkdir(parents=True, exist_ok=True)
     # write_text 默认 UTF-8 无 BOM，符合 MASM 要求
     (OUTDIR / name).write_text(new, encoding="utf-8")
     print(f"[mkvariants] {name} <- HWSCOPE.ASM (VARIANT={variant})")

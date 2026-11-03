@@ -61,8 +61,14 @@ HWSCOPE运行截图.png       主环境运行效果
 
 ## 运行测试
 
-一条命令完成四构件构建、字体结构断言、无头运行、显存与文本断言、提交版冒烟（约 130 秒，40 项全过）：
+设置 `HWSCOPE_MASM_DIR` 指向含 `MASM.EXE`、`LINK.EXE` 的目录，然后运行：
 
 ```bat
-D:\Python313\python.exe tests\run_tests.py
+python tests/run_tests.py
 ```
+
+脚本从 PATH 查找 `dosbox-x` 或 `dosbox`，也可通过 `HWSCOPE_DOSBOX` 指定可执行文件。工具链复制到每次独立创建的 ASCII 临时目录，项目路径可以包含中文；如果系统临时目录包含非 ASCII 字符，可用 `HWSCOPE_RUN_BASE` 指定一个 ASCII 父目录。运行目录与日志会保留，不会清空此前运行。
+
+完整流程依次执行四构件构建、HWV、HWD 五轮吞吐测量，以及 KEYHOOK 注入 X／ESC 的提交版两轮测量，共 40 项检查。默认总时限为 360 秒，可通过 `HWSCOPE_TIMEOUT`（秒）调整；数值量程、稳定性和图形断言阈值不随总时限改变。DOSBox-X 自动使用默认配置并跳过启动目录选择提示，避免无头运行等待交互。
+
+结果写入 `tests/out/<时间>/report.txt`，`run.json` 记录各阶段耗时和模拟器退出码，`dosbox.log` 保存模拟器日志；`tests/env.json` 指向本次独立运行目录。宿主侧启动与目录生成回归检查可单独运行 `python -m unittest discover -s tests -p test_harness.py`。
